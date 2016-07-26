@@ -1,24 +1,56 @@
 #!/usr/bin/ash
 
-CRYPTMOUNTS_PATH="$1"
+CRYPTNAME="$1"
 
-panic() { while :; do echo o > /proc/sysrq-trigger; done }
+panic() { echo "panic!" 1>&2; sleep 2; while :; do echo o > /proc/sysrq-trigger; done }
 
 # Start udev from initramfs
-/usr/lib/systemd/systemd-udevd --daemon --resolve-names=never
+/usr/lib/systemd/systemd-udevd --daemon --resolve-names=never >/dev/null
 
-# Suspend crypt devices, else shutdown
+# Suspend root device, else shutdown
 FAIL=0
-while IFS=$'\t' read -r mtpt name; do
-    cryptsetup luksSuspend "$name" || FAIL=1
-done < "$CRYPTMOUNTS_PATH"
+cryptsetup luksSuspend "/dev/mapper/${CRYPTNAME}" || FAIL=1
 if test "$FAIL" -eq 1; then panic; fi
 
 # Suspend the system
 echo mem > /sys/power/state
 
+# get keyfile and header
+ckeyfile="/crypto_keyfile.bin"
+luksheader="/luks_header.bin"
+keydev="$(sed -n 's/.*cryptkey=\([^: ]*\).*$/\1/p' /proc/cmdline)"
+
+source /init_functions
+# need to tell resolve_device() that udevd is running
+udevd_running=1
+# set root delay to 1 minute
+rootdelay=60
+
+if resolved=$(resolve_device "${keydev}"); then
+	mkdir -p /ckey
+	mount -r -t vfat "$resolved" /ckey
+	dd if="/ckey/crypto_keyfile.bin" of="$ckeyfile" >/dev/null 2>&1
+	dd if="/ckey/luks_header.bin" of="$luksheader" >/dev/null 2>&1
+	umount /ckey
+fi
+
+[ ! -f "$ckeyfile" ] && panic
+
 # Resume root device, else shutdown
-cryptsetup luksResume "$(awk -F"\t" '/\/\t/{ print $2 }' "$CRYPTMOUNTS_PATH")" || panic
+while true; do
+  # Use whatever decryption you want here
+	openssl enc -d -cast5-cbc -in ${ckeyfile} 2>/dev/null | cryptsetup --key-file=- --header ${luksheader} luksResume /dev/mapper/${CRYPTNAME} >/dev/null 2>&1
+	ret=$?
+	if [ "$ret" == "0" ]; then
+		break
+	else
+		sleep 2
+		echo "Bad password." 1>&2
+	fi
+done
+
+rm -f "${luksheader}"
+rm -f "${ckeyfile}"
 
 # Stop udev from initramfs, as the real daemon from rootfs will be restarted
 udevadm control --exit
